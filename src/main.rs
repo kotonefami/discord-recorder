@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::BufWriter;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Local;
@@ -133,6 +134,7 @@ impl VoiceEventHandler for Receiver {
 struct BotHandler {
     target_channel_id: ChannelId,
     session: Arc<Mutex<Option<RecordingSession>>>,
+    events_registered: AtomicBool,
 }
 
 impl BotHandler {
@@ -148,13 +150,15 @@ impl BotHandler {
         let mut session_lock = self.session.lock().await;
 
         if current_users > 0 && session_lock.is_none() {
-            let dir_name = Local::now().format("%y%m%d%H%M%S").to_string();
+            let dir_name = Local::now().format("%Y%m%d%H%M%S").to_string();
             *session_lock = Some(RecordingSession::new(&dir_name));
             
             if let Ok(handler_lock) = manager.join(guild_id, self.target_channel_id).await {
                 let mut handler = handler_lock.lock().await;
-                handler.add_global_event(Event::Core(CoreEvent::SpeakingStateUpdate), Receiver { session: self.session.clone(), ctx: ctx.clone() });
-                handler.add_global_event(Event::Core(CoreEvent::VoiceTick), Receiver { session: self.session.clone(), ctx: ctx.clone() });
+                if !self.events_registered.swap(true, Ordering::Relaxed) {
+                    handler.add_global_event(Event::Core(CoreEvent::SpeakingStateUpdate), Receiver { session: self.session.clone(), ctx: ctx.clone() });
+                    handler.add_global_event(Event::Core(CoreEvent::VoiceTick), Receiver { session: self.session.clone(), ctx: ctx.clone() });
+                }
             }
             println!("[{}] 録音セッションを開始しました。", dir_name);
 
@@ -194,11 +198,15 @@ let intents = GatewayIntents::GUILDS
     let handler = BotHandler {
         target_channel_id: ChannelId::new(target_channel),
         session: Arc::new(Mutex::new(None)),
+        events_registered: AtomicBool::new(false),
     };
 
     // 【最重要設定】Songbird内部で自動的に復号化とPCMデコードを行う
     let songbird_config = songbird::Config::default()
-        .decode_mode(DecodeMode::Decode(DecodeConfig::default()));
+        .decode_mode(DecodeMode::Decode(DecodeConfig::new(
+            songbird::driver::Channels::Stereo,
+            songbird::driver::SampleRate::Hz48000,
+        )));
 
     let mut client = Client::builder(&token, intents)
         .event_handler(handler)
