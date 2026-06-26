@@ -1,0 +1,13 @@
+[package]
+name = "discord_recorder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.103"
+audiopus = "0.2.0"
+chrono = "0.4.45"
+hound = "3.5.1"
+serenity = { version = "0.12.5", features = ["client", "gateway", "model", "cache", "voice"] }
+songbird = { version = "0.6.0", features = ["receive"] }
+tokio = { version = "1.52.3", features = ["full"] }
