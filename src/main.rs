@@ -14,16 +14,117 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Local;
 
-/// サンプリング周波数 (Hz)
-const SAMPLING_RATE: u32 = 48000;
-/// オーディオチャンネル数
-const CHANNELS: u16 = 2;
-/// 1Tickあたりのサンプル数（20ms × 48kHz、1chあたり960 × 2ch）
-const SAMPLES_PER_TICK: u64 = 1920;
+/// バッファリング中の Opus フレーム
+struct PendingFrame {
+    data: Vec<u8>,
+    absgp: u64,
+}
 
-/// ユーザーごとのWAVライター
+/// ユーザーごとの Opus トラック
 struct UserTrack {
-    writer: hound::WavWriter<BufWriter<fs::File>>,
+    encoder: audiopus::coder::Encoder,
+    ogg_writer: ogg::PacketWriter<'static, BufWriter<std::fs::File>>,
+    packet_count: u64,
+    pre_skip: u16,
+    pending: Option<PendingFrame>,
+}
+
+impl UserTrack {
+    /// 新しい Opus トラックを作成します。
+    fn create(path: std::path::PathBuf, bitrate: i32) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = BufWriter::new(std::fs::File::create(path)?);
+        let mut ogg_writer = ogg::PacketWriter::new(file);
+
+        let mut encoder = audiopus::coder::Encoder::new(
+            audiopus::SampleRate::Hz48000,
+            audiopus::Channels::Stereo,
+            audiopus::Application::Audio,
+        )?;
+        encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(bitrate))?;
+        let lookahead = encoder.lookahead()? as u16;
+
+        // OpusHead パケット (19 bytes)
+        let mut head = Vec::with_capacity(19);
+        head.extend_from_slice(b"OpusHead");
+        head.push(1);
+        head.push(2);
+        head.extend_from_slice(&lookahead.to_le_bytes());
+        head.extend_from_slice(&48000u32.to_le_bytes());
+        head.extend_from_slice(&0i16.to_le_bytes());
+        head.push(0);
+
+        ogg_writer.write_packet(
+            head,
+            1,
+            ogg::PacketWriteEndInfo::EndPage,
+            0,
+        )?;
+
+        // OpusTags パケット
+        let vendor = b"discord_recorder";
+        let mut tags = Vec::new();
+        tags.extend_from_slice(b"OpusTags");
+        tags.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
+        tags.extend_from_slice(vendor);
+        tags.extend_from_slice(&0u32.to_le_bytes());
+
+        ogg_writer.write_packet(
+            tags,
+            1,
+            ogg::PacketWriteEndInfo::EndPage,
+            0,
+        )?;
+
+        Ok(Self {
+            encoder,
+            ogg_writer,
+            packet_count: 0,
+            pre_skip: lookahead,
+            pending: None,
+        })
+    }
+
+    /// 20ms 分の PCM を Opus にエンコードして Ogg に書き込みます。
+    /// 最終フレームはバッファリングし、finalize() で EOS フラグ付きで書き出します。
+    fn write_frame(&mut self, pcm: &[i16]) -> Result<(), Box<dyn std::error::Error>> {
+        let mut output = vec![0u8; 4000];
+        let len = self.encoder.encode(pcm, &mut output)?;
+        output.truncate(len);
+
+        let absgp = self.pre_skip as u64 + self.packet_count * 960;
+        self.packet_count += 1;
+
+        if let Some(prev) = self.pending.replace(PendingFrame { data: output, absgp }) {
+            self.ogg_writer.write_packet(
+                prev.data,
+                1,
+                ogg::PacketWriteEndInfo::NormalPacket,
+                prev.absgp,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 無音フレーム（ゼロ埋め）をエンコードして書き込みます。
+    fn write_silent_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        static ZERO_PCM: [i16; 1920] = [0; 1920];
+        self.write_frame(&ZERO_PCM)
+    }
+
+    /// Ogg Opus ストリームを正しく閉じます。
+    /// バッファリングしていた最終フレームに EOS フラグを付けて書き出します。
+    fn finalize(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(prev) = self.pending.take() {
+            let absgp = self.pre_skip as u64 + self.packet_count * 960;
+            self.ogg_writer.write_packet(
+                prev.data,
+                1,
+                ogg::PacketWriteEndInfo::EndStream,
+                absgp,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// 一回の録音セッションを管理する構造体
@@ -32,38 +133,44 @@ struct RecordingSession {
     dir_path: PathBuf,
     /// SSRCからユーザーIDへのマップ
     ssrc_to_user: HashMap<u32, UserId>,
+    /// ユーザーIDからSSRCへの逆引きマップ
+    user_id_to_ssrc: HashMap<UserId, u32>,
     /// ユーザーIDから表示名へのマップ
     user_id_to_name: HashMap<UserId, String>,
     /// ユーザーごとの音声トラック
     tracks: HashMap<UserId, UserTrack>,
     /// 経過Tick数（20ms単位）
     tick_count: u64,
+    /// Discord チャンネルのビットレート
+    bitrate: i32,
 }
 
 impl RecordingSession {
     /// 新しい録音セッションを作成します。
-    fn new(dir_name: &str) -> Self {
+    fn new(dir_name: &str, bitrate: i32) -> Self {
         let dir_path = PathBuf::from("output").join(dir_name);
         fs::create_dir_all(&dir_path).unwrap();
         Self {
             dir_path,
             ssrc_to_user: HashMap::new(),
+            user_id_to_ssrc: HashMap::new(),
             user_id_to_name: HashMap::new(),
             tracks: HashMap::new(),
             tick_count: 0,
+            bitrate,
         }
     }
 
-    /// 全トラックのWAVヘッダを確定して閉じます。
-    fn finalize(self) {
-        for (_, track) in self.tracks {
-            let _ = track.writer.finalize();
+    /// 全トラックの Opus ファイルを確定して閉じます。
+    fn finalize(mut self) {
+        for (_, track) in self.tracks.drain() {
+            if let Err(e) = track.finalize() {
+                eprintln!("ファイルの確定に失敗しました: {}", e);
+            }
         }
     }
 
     /// 録音セッションを開始します。
-    /// 出力ディレクトリを作成し、ボイスチャンネルに参加して発話イベントの受信を始めます。
-    /// 既にセッションが存在する場合は何もせずに戻ります。
     async fn start(
         guild_id: GuildId,
         channel_id: ChannelId,
@@ -77,7 +184,13 @@ impl RecordingSession {
                 return;
             }
             dir_name = Local::now().format("%Y%m%d%H%M%S").to_string();
-            *guard = Some(RecordingSession::new(&dir_name));
+
+            let bitrate = channel_id.to_channel(&ctx.http).await
+                .ok()
+                .and_then(|c| c.guild().and_then(|gc| gc.bitrate.map(|b| b as i32)))
+                .unwrap_or(64000);
+
+            *guard = Some(RecordingSession::new(&dir_name, bitrate));
         }
 
         let manager = songbird::get(ctx).await.expect("Songbirdの初期化に失敗").clone();
@@ -100,11 +213,20 @@ impl RecordingSession {
     }
 
     /// 録音セッションを終了します。
-    /// WAVファイルを確定し、ボイスチャンネルから切断して Call を破棄します。
     async fn end(self, ctx: &Context, guild_id: GuildId) {
         self.finalize();
         let manager = songbird::get(ctx).await.expect("Songbirdの初期化に失敗").clone();
         let _ = manager.remove(guild_id).await;
+    }
+}
+
+impl Drop for RecordingSession {
+    fn drop(&mut self) {
+        for (_, track) in self.tracks.drain() {
+            if let Err(e) = track.finalize() {
+                eprintln!("Drop内でのファイル確定に失敗: {}", e);
+            }
+        }
     }
 }
 
@@ -128,8 +250,8 @@ impl VoiceEventHandler for Receiver {
                 let Some(voice_uid) = speaking.user_id else { return None; };
                 let id = UserId::new(voice_uid.0);
                 session.ssrc_to_user.insert(speaking.ssrc, id);
+                session.user_id_to_ssrc.insert(id, speaking.ssrc);
 
-                // 途中参加したユーザーのWAVファイルを作成し、開始からの経過時間分の無音を前詰めする
                 if !session.tracks.contains_key(&id) {
                     let name = match id.to_user(&self.ctx.http).await {
                         Ok(user) => user.name,
@@ -137,50 +259,43 @@ impl VoiceEventHandler for Receiver {
                     };
                     session.user_id_to_name.insert(id, name.clone());
 
-                    let file_path = session.dir_path.join(format!("{}.wav", name));
-                    let spec = hound::WavSpec {
-                        channels: CHANNELS,
-                        sample_rate: SAMPLING_RATE,
-                        bits_per_sample: 16,
-                        sample_format: hound::SampleFormat::Int,
-                    };
-                    let mut writer = hound::WavWriter::create(file_path, spec).unwrap();
+                    let file_path = session.dir_path.join(format!("{}.opus", name));
+                    let mut track = UserTrack::create(file_path, session.bitrate)
+                        .map_err(|e| eprintln!("Opusファイル作成失敗: {}", e))
+                        .ok()?;
 
-                    // 参加が遅れた分のTick（時間）をゼロ埋めして、DAW上の開始位置を強制同期させる
-                    let missing_samples = session.tick_count * SAMPLES_PER_TICK;
-                    for _ in 0..missing_samples {
-                        writer.write_sample(0i16).unwrap();
+                    let missing_frames = session.tick_count;
+                    for _ in 0..missing_frames {
+                        if let Err(e) = track.write_silent_frame() {
+                            eprintln!("無音書き込み失敗: {}", e);
+                            break;
+                        }
                     }
 
-                    session.tracks.insert(id, UserTrack { writer });
+                    session.tracks.insert(id, track);
                 }
             }
             EventContext::VoiceTick(tick) => {
                 session.tick_count += 1;
 
-                // 20msの正確なメトロノームに合わせて、全員分のトラックに音声を書き込む
                 for (user_id, track) in session.tracks.iter_mut() {
-                    let ssrc = session.ssrc_to_user.iter()
-                        .find(|(_, &id)| id == *user_id)
-                        .map(|(&ssrc, _)| ssrc);
+                    let ssrc = session.user_id_to_ssrc.get(user_id).copied();
 
                     let mut audio_written = false;
                     if let Some(ssrc) = ssrc {
-                        // この20ms間にユーザーが発声していれば、デコード済みのPCMを取得
                         if let Some(voice_data) = tick.speaking.get(&ssrc) {
                             if let Some(decoded) = &voice_data.decoded_voice {
-                                for &sample in decoded {
-                                    track.writer.write_sample(sample).unwrap();
+                                if let Err(e) = track.write_frame(decoded) {
+                                    eprintln!("音声書き込み失敗: {}", e);
                                 }
                                 audio_written = true;
                             }
                         }
                     }
 
-                    // 無音だった場合（またはパケットロス時）は強制的にゼロを書き込んで同期を維持する
                     if !audio_written {
-                        for _ in 0..SAMPLES_PER_TICK {
-                            track.writer.write_sample(0i16).unwrap();
+                        if let Err(e) = track.write_silent_frame() {
+                            eprintln!("無音書き込み失敗: {}", e);
                         }
                     }
                 }
