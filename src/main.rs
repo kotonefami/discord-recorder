@@ -10,28 +10,38 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::BufWriter;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Local;
 
+/// サンプリング周波数 (Hz)
 const SAMPLING_RATE: u32 = 48000;
+/// オーディオチャンネル数
 const CHANNELS: u16 = 2;
-const SAMPLES_PER_TICK: u64 = 1920; // 20ms * 48kHz (1chあたり960 * 2ch)
+/// 1Tickあたりのサンプル数（20ms × 48kHz、1chあたり960 × 2ch）
+const SAMPLES_PER_TICK: u64 = 1920;
 
+/// ユーザーごとのWAVライター
 struct UserTrack {
     writer: hound::WavWriter<BufWriter<fs::File>>,
 }
 
+/// 一回の録音セッションを管理する構造体
 struct RecordingSession {
+    /// 出力ディレクトリのパス
     dir_path: PathBuf,
+    /// SSRCからユーザーIDへのマップ
     ssrc_to_user: HashMap<u32, UserId>,
+    /// ユーザーIDから表示名へのマップ
     user_id_to_name: HashMap<UserId, String>,
+    /// ユーザーごとの音声トラック
     tracks: HashMap<UserId, UserTrack>,
-    tick_count: u64, // 20msごとの絶対時間軸
+    /// 経過Tick数（20ms単位）
+    tick_count: u64,
 }
 
 impl RecordingSession {
+    /// 新しい録音セッションを作成します。
     fn new(dir_name: &str) -> Self {
         let dir_path = PathBuf::from("output").join(dir_name);
         fs::create_dir_all(&dir_path).unwrap();
@@ -44,21 +54,71 @@ impl RecordingSession {
         }
     }
 
-    // セッション終了時に全ファイルのWAVヘッダを確定させて安全に閉じる
+    /// 全トラックのWAVヘッダを確定して閉じます。
     fn finalize(self) {
         for (_, track) in self.tracks {
             let _ = track.writer.finalize();
         }
     }
+
+    /// 録音セッションを開始します。
+    /// 出力ディレクトリを作成し、ボイスチャンネルに参加して発話イベントの受信を始めます。
+    /// 既にセッションが存在する場合は何もせずに戻ります。
+    async fn start(
+        guild_id: GuildId,
+        channel_id: ChannelId,
+        ctx: &Context,
+        session: &Arc<Mutex<Option<RecordingSession>>>,
+    ) {
+        let dir_name;
+        {
+            let mut guard = session.lock().await;
+            if guard.is_some() {
+                return;
+            }
+            dir_name = Local::now().format("%Y%m%d%H%M%S").to_string();
+            *guard = Some(RecordingSession::new(&dir_name));
+        }
+
+        let manager = songbird::get(ctx).await.expect("Songbirdの初期化に失敗").clone();
+        let call = manager.get_or_insert(guild_id);
+        {
+            let mut handler = call.lock().await;
+            handler.add_global_event(Event::Core(CoreEvent::SpeakingStateUpdate), Receiver {
+                session: session.clone(),
+                ctx: ctx.clone(),
+            });
+            handler.add_global_event(Event::Core(CoreEvent::VoiceTick), Receiver {
+                session: session.clone(),
+                ctx: ctx.clone(),
+            });
+        }
+        if let Err(e) = manager.join(guild_id, channel_id).await {
+            eprintln!("音声チャンネルへの参加に失敗: {:?}", e);
+        }
+        println!("[{}] 録音セッションを開始しました。", dir_name);
+    }
+
+    /// 録音セッションを終了します。
+    /// WAVファイルを確定し、ボイスチャンネルから切断して Call を破棄します。
+    async fn end(self, ctx: &Context, guild_id: GuildId) {
+        self.finalize();
+        let manager = songbird::get(ctx).await.expect("Songbirdの初期化に失敗").clone();
+        let _ = manager.remove(guild_id).await;
+    }
 }
 
+/// Songbirdの音声イベントを受信するハンドラ
 struct Receiver {
+    /// 共有セッションへの参照
     session: Arc<Mutex<Option<RecordingSession>>>,
+    /// Serenityコンテキスト（ユーザー名解決に使用）
     ctx: Context,
 }
 
 #[async_trait]
 impl VoiceEventHandler for Receiver {
+    /// 音声イベントを処理します。
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         let mut session_opt = self.session.lock().await;
         let Some(session) = session_opt.as_mut() else { return None; };
@@ -68,7 +128,7 @@ impl VoiceEventHandler for Receiver {
                 let Some(voice_uid) = speaking.user_id else { return None; };
                 let id = UserId::new(voice_uid.0);
                 session.ssrc_to_user.insert(speaking.ssrc, id);
-                
+
                 // 途中参加したユーザーのWAVファイルを作成し、開始からの経過時間分の無音を前詰めする
                 if !session.tracks.contains_key(&id) {
                     let name = match id.to_user(&self.ctx.http).await {
@@ -76,7 +136,7 @@ impl VoiceEventHandler for Receiver {
                         Err(_) => id.to_string(),
                     };
                     session.user_id_to_name.insert(id, name.clone());
-                    
+
                     let file_path = session.dir_path.join(format!("{}.wav", name));
                     let spec = hound::WavSpec {
                         channels: CHANNELS,
@@ -85,13 +145,13 @@ impl VoiceEventHandler for Receiver {
                         sample_format: hound::SampleFormat::Int,
                     };
                     let mut writer = hound::WavWriter::create(file_path, spec).unwrap();
-                    
+
                     // 参加が遅れた分のTick（時間）をゼロ埋めして、DAW上の開始位置を強制同期させる
                     let missing_samples = session.tick_count * SAMPLES_PER_TICK;
                     for _ in 0..missing_samples {
                         writer.write_sample(0i16).unwrap();
                     }
-                    
+
                     session.tracks.insert(id, UserTrack { writer });
                 }
             }
@@ -103,7 +163,7 @@ impl VoiceEventHandler for Receiver {
                     let ssrc = session.ssrc_to_user.iter()
                         .find(|(_, &id)| id == *user_id)
                         .map(|(&ssrc, _)| ssrc);
-                    
+
                     let mut audio_written = false;
                     if let Some(ssrc) = ssrc {
                         // この20ms間にユーザーが発声していれば、デコード済みのPCMを取得
@@ -131,56 +191,43 @@ impl VoiceEventHandler for Receiver {
     }
 }
 
+/// Serenityのイベントを処理するハンドラ
 struct BotHandler {
+    /// 録音対象のボイスチャンネルID
     target_channel_id: ChannelId,
+    /// 共有セッションへの参照
     session: Arc<Mutex<Option<RecordingSession>>>,
-    events_registered: AtomicBool,
 }
 
 impl BotHandler {
+    /// ボイスチャンネルの状態を確認し、録音を開始または終了します。
     async fn check_and_manage_recording(&self, ctx: &Context, guild_id: GuildId) {
-        let manager = songbird::get(ctx).await.expect("Songbirdの初期化に失敗").clone();
-        
         let current_users = ctx.cache.guild(guild_id).map(|guild| {
             guild.voice_states.values()
                 .filter(|vs| vs.channel_id == Some(self.target_channel_id) && vs.user_id != ctx.cache.current_user().id)
                 .count()
         }).unwrap_or(0);
 
-        let mut session_lock = self.session.lock().await;
-
-        if current_users > 0 && session_lock.is_none() {
-            let dir_name = Local::now().format("%Y%m%d%H%M%S").to_string();
-            *session_lock = Some(RecordingSession::new(&dir_name));
-
-            // get_or_insert で先に Call を作成し、join 前にイベントを登録する
-            // これをしないと join 時に飛んでくる初期 SpeakingStateUpdate を聞き逃す
-            let handler_lock = manager.get_or_insert(guild_id);
-            {
-                let mut handler = handler_lock.lock().await;
-                if !self.events_registered.swap(true, Ordering::Relaxed) {
-                    handler.add_global_event(Event::Core(CoreEvent::SpeakingStateUpdate), Receiver { session: self.session.clone(), ctx: ctx.clone() });
-                    handler.add_global_event(Event::Core(CoreEvent::VoiceTick), Receiver { session: self.session.clone(), ctx: ctx.clone() });
-                }
+        if current_users > 0 {
+            RecordingSession::start(
+                guild_id,
+                self.target_channel_id,
+                ctx,
+                &self.session,
+            ).await;
+        } else {
+            let mut guard = self.session.lock().await;
+            if let Some(session) = guard.take() {
+                drop(guard);
+                session.end(ctx, guild_id).await;
             }
-
-            if let Err(e) = manager.join(guild_id, self.target_channel_id).await {
-                eprintln!("音声チャンネルへの参加に失敗: {:?}", e);
-            }
-            println!("[{}] 録音セッションを開始しました。", dir_name);
-
-        } else if current_users == 0 && session_lock.is_some() {
-            if let Some(session) = session_lock.take() {
-                session.finalize(); // 所有権を渡してWAVファイルを安全に閉じる
-            }
-            let _ = manager.leave(guild_id).await;
-            println!("全員が退出したため、録音セッションを終了しました。");
         }
     }
 }
 
 #[async_trait]
 impl EventHandler for BotHandler {
+    /// Botが起動したときに呼ばれます。
     async fn ready(&self, ctx: Context, ready: serenity::model::gateway::Ready) {
         println!("Botが起動しました: {}", ready.user.name);
         for guild in ready.guilds {
@@ -188,6 +235,7 @@ impl EventHandler for BotHandler {
         }
     }
 
+    /// ボイス状態が変化したときに呼ばれます。
     async fn voice_state_update(&self, ctx: Context, old: Option<VoiceState>, new: VoiceState) {
         let Some(guild_id) = new.guild_id.or_else(|| old.and_then(|o| o.guild_id)) else { return; };
         self.check_and_manage_recording(&ctx, guild_id).await;
@@ -198,14 +246,13 @@ impl EventHandler for BotHandler {
 async fn main() {
     let token = "TOKEN_HERE";
     let target_channel: u64 = 0;
-let intents = GatewayIntents::GUILDS 
-        | GatewayIntents::GUILD_VOICE_STATES 
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_VOICE_STATES
         | GatewayIntents::GUILD_MEMBERS;
 
     let handler = BotHandler {
         target_channel_id: ChannelId::new(target_channel),
         session: Arc::new(Mutex::new(None)),
-        events_registered: AtomicBool::new(false),
     };
 
     // 【最重要設定】Songbird内部で自動的に復号化とPCMデコードを行う
