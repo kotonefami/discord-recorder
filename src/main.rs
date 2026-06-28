@@ -206,8 +206,14 @@ impl RecordingSession {
                 ctx: ctx.clone(),
             });
         }
-        if let Err(e) = manager.join(guild_id, channel_id).await {
-            eprintln!("音声チャンネルへの参加に失敗: {:?}", e);
+        match manager.join(guild_id, channel_id).await {
+            Ok(call) => {
+                let mut handler = call.lock().await;
+                let _ = handler.mute(true).await;
+            }
+            Err(e) => {
+                eprintln!("音声チャンネルへの参加に失敗: {:?}", e);
+            }
         }
         println!("[{}] 録音セッションを開始しました。", dir_name);
     }
@@ -216,6 +222,10 @@ impl RecordingSession {
     async fn end(self, ctx: &Context, guild_id: GuildId) {
         self.finalize();
         let manager = songbird::get(ctx).await.expect("Songbirdの初期化に失敗").clone();
+        if let Some(call) = manager.get(guild_id) {
+            let mut handler = call.lock().await;
+            let _ = handler.mute(false).await;
+        }
         let _ = manager.remove(guild_id).await;
     }
 }
