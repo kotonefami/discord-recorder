@@ -152,13 +152,20 @@ impl BotHandler {
         if current_users > 0 && session_lock.is_none() {
             let dir_name = Local::now().format("%Y%m%d%H%M%S").to_string();
             *session_lock = Some(RecordingSession::new(&dir_name));
-            
-            if let Ok(handler_lock) = manager.join(guild_id, self.target_channel_id).await {
+
+            // get_or_insert で先に Call を作成し、join 前にイベントを登録する
+            // これをしないと join 時に飛んでくる初期 SpeakingStateUpdate を聞き逃す
+            let handler_lock = manager.get_or_insert(guild_id);
+            {
                 let mut handler = handler_lock.lock().await;
                 if !self.events_registered.swap(true, Ordering::Relaxed) {
                     handler.add_global_event(Event::Core(CoreEvent::SpeakingStateUpdate), Receiver { session: self.session.clone(), ctx: ctx.clone() });
                     handler.add_global_event(Event::Core(CoreEvent::VoiceTick), Receiver { session: self.session.clone(), ctx: ctx.clone() });
                 }
+            }
+
+            if let Err(e) = manager.join(guild_id, self.target_channel_id).await {
+                eprintln!("音声チャンネルへの参加に失敗: {:?}", e);
             }
             println!("[{}] 録音セッションを開始しました。", dir_name);
 
