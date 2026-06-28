@@ -1,18 +1,20 @@
+use chrono::Local;
+use dotenvy::dotenv;
 use serenity::async_trait;
 use serenity::all::GatewayIntents;
 use serenity::model::id::{ChannelId, GuildId, UserId};
 use serenity::model::voice::VoiceState;
 use serenity::prelude::*;
+use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 use songbird::{CoreEvent, SerenityInit};
-use songbird::driver::{DecodeConfig, DecodeMode};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use chrono::Local;
 
 /// バッファリング中の Opus フレーム
 struct PendingFrame {
@@ -369,8 +371,13 @@ impl EventHandler for BotHandler {
 
 #[tokio::main]
 async fn main() {
-    let token = "TOKEN_HERE";
-    let target_channel: u64 = 0;
+    dotenv().ok();
+
+    let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN が設定されていません");
+    let target_channel: u64 = env::var("DISCORD_CHANNEL_ID")
+        .expect("DISCORD_CHANNEL_ID が設定されていません")
+        .parse()
+        .expect("DISCORD_CHANNEL_ID が数値ではありません");
     let intents = GatewayIntents::GUILDS
         | GatewayIntents::GUILD_VOICE_STATES
         | GatewayIntents::GUILD_MEMBERS;
