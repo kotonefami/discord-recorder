@@ -373,11 +373,21 @@ impl EventHandler for BotHandler {
 async fn main() {
     dotenv().ok();
 
-    let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN が設定されていません");
-    let target_channel: u64 = env::var("DISCORD_CHANNEL_ID")
-        .expect("DISCORD_CHANNEL_ID が設定されていません")
-        .parse()
-        .expect("DISCORD_CHANNEL_ID が数値ではありません");
+    let args: Vec<String> = std::env::args().collect();
+    let (token, target_channel) = if args.len() >= 3 {
+        // NOTE: コマンドライン引数から取得: *.exe [token] [channel]
+        let token = args[1].clone();
+        let channel_id: u64 = args[2].parse().expect("チャンネルIDが数値ではありません");
+        (token, channel_id)
+    } else {
+        // NOTE: 環境変数から取得（フォールバック）
+        let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN が設定されていません");
+        let channel_id: u64 = env::var("DISCORD_CHANNEL_ID")
+            .expect("DISCORD_CHANNEL_ID が設定されていません")
+            .parse()
+            .expect("DISCORD_CHANNEL_ID が数値ではありません");
+        (token, channel_id)
+    };
     let intents = GatewayIntents::GUILDS
         | GatewayIntents::GUILD_VOICE_STATES
         | GatewayIntents::GUILD_MEMBERS;
