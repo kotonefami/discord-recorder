@@ -12,3 +12,8 @@ ogg = "0.9"
 serenity = { version = "0.12.5", features = ["client", "gateway", "model", "cache", "voice"] }
 songbird = { version = "0.6.0", features = ["receive"] }
 tokio = { version = "1.52.3", features = ["full"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
