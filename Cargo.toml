@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1.0.103"
 audiopus = "0.3.0-rc.0"
 chrono = "0.4.45"
+clap = { version = "4.6.1", features = ["derive", "env"] }
 dotenvy = "0.15.7"
 ogg = "0.9"
 serenity = { version = "0.12.5", features = ["client", "gateway", "model", "cache", "voice"] }

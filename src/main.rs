@@ -1,4 +1,5 @@
 use chrono::Local;
+use clap::Parser;
 use dotenvy::dotenv;
 use serenity::async_trait;
 use serenity::all::GatewayIntents;
@@ -9,12 +10,28 @@ use songbird::driver::{DecodeConfig, DecodeMode};
 use songbird::events::{Event, EventContext, EventHandler as VoiceEventHandler};
 use songbird::{CoreEvent, SerenityInit};
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// コマンドライン引数
+#[derive(Parser)]
+#[command(name = "discord_recorder", about = "Discord ボイスチャンネルの録音ツール")]
+struct Args {
+    /// Discord Bot トークン
+    #[arg(env = "DISCORD_TOKEN")]
+    token: String,
+
+    /// 録音対象のボイスチャンネル ID
+    #[arg(env = "DISCORD_CHANNEL_ID")]
+    channel_id: u64,
+
+    /// 録音ファイルの出力ディレクトリ
+    #[arg(short, long, env = "OUTPUT_DIR", default_value = "output")]
+    output: PathBuf,
+}
 
 /// バッファリング中の Opus フレーム
 struct PendingFrame {
@@ -149,8 +166,8 @@ struct RecordingSession {
 
 impl RecordingSession {
     /// 新しい録音セッションを作成します。
-    fn new(dir_name: &str, bitrate: i32) -> Self {
-        let dir_path = PathBuf::from("output").join(dir_name);
+    fn new(output_dir: &PathBuf, dir_name: &str, bitrate: i32) -> Self {
+        let dir_path = output_dir.join(dir_name);
         fs::create_dir_all(&dir_path).unwrap();
         Self {
             dir_path,
@@ -178,6 +195,7 @@ impl RecordingSession {
         channel_id: ChannelId,
         ctx: &Context,
         session: &Arc<Mutex<Option<RecordingSession>>>,
+        output_dir: &PathBuf,
     ) {
         let dir_name;
         {
@@ -192,7 +210,7 @@ impl RecordingSession {
                 .and_then(|c| c.guild().and_then(|gc| gc.bitrate.map(|b| b as i32)))
                 .unwrap_or(64000);
 
-            *guard = Some(RecordingSession::new(&dir_name, bitrate));
+            *guard = Some(RecordingSession::new(output_dir, &dir_name, bitrate));
         }
 
         let manager = songbird::get(ctx).await.expect("Songbirdの初期化に失敗").clone();
@@ -322,6 +340,8 @@ impl VoiceEventHandler for Receiver {
 struct BotHandler {
     /// 録音対象のボイスチャンネルID
     target_channel_id: ChannelId,
+    /// 録音ファイルの出力ディレクトリ
+    output_dir: PathBuf,
     /// 共有セッションへの参照
     session: Arc<Mutex<Option<RecordingSession>>>,
 }
@@ -341,6 +361,7 @@ impl BotHandler {
                 self.target_channel_id,
                 ctx,
                 &self.session,
+                &self.output_dir,
             ).await;
         } else {
             let mut guard = self.session.lock().await;
@@ -373,27 +394,14 @@ impl EventHandler for BotHandler {
 async fn main() {
     dotenv().ok();
 
-    let args: Vec<String> = std::env::args().collect();
-    let (token, target_channel) = if args.len() >= 3 {
-        // NOTE: コマンドライン引数から取得: *.exe [token] [channel]
-        let token = args[1].clone();
-        let channel_id: u64 = args[2].parse().expect("チャンネルIDが数値ではありません");
-        (token, channel_id)
-    } else {
-        // NOTE: 環境変数から取得（フォールバック）
-        let token = env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN が設定されていません");
-        let channel_id: u64 = env::var("DISCORD_CHANNEL_ID")
-            .expect("DISCORD_CHANNEL_ID が設定されていません")
-            .parse()
-            .expect("DISCORD_CHANNEL_ID が数値ではありません");
-        (token, channel_id)
-    };
+    let args = Args::parse();
     let intents = GatewayIntents::GUILDS
         | GatewayIntents::GUILD_VOICE_STATES
         | GatewayIntents::GUILD_MEMBERS;
 
     let handler = BotHandler {
-        target_channel_id: ChannelId::new(target_channel),
+        target_channel_id: ChannelId::new(args.channel_id),
+        output_dir: args.output,
         session: Arc::new(Mutex::new(None)),
     };
 
@@ -404,7 +412,7 @@ async fn main() {
             songbird::driver::SampleRate::Hz48000,
         )));
 
-    let mut client = Client::builder(&token, intents)
+    let mut client = Client::builder(&args.token, intents)
         .event_handler(handler)
         .register_songbird_from_config(songbird_config)
         .await
