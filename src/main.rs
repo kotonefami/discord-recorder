@@ -433,6 +433,14 @@ async fn main() {
         .await
         .expect("クライアントの作成に失敗しました");
 
+    let shard_manager = client.shard_manager.clone();
+
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("Ctrl+Cシグナルの受信に失敗");
+        println!("\nシャットダウンシグナルを受信しました...");
+        shard_manager.shutdown_all().await;
+    });
+
     if let Err(why) = client.start().await {
         eprintln!("クライアントの実行エラー: {:?}", why);
     }
