@@ -31,6 +31,10 @@ struct Args {
     /// 録音ファイルの出力ディレクトリ
     #[arg(short, long, env = "OUTPUT_DIR", default_value = "output")]
     output: PathBuf,
+
+    /// カスタムステータスメッセージ
+    #[arg(short, long, env = "CUSTOM_STATUS")]
+    status: Option<String>,
 }
 
 /// バッファリング中の Opus フレーム
@@ -344,6 +348,8 @@ struct BotHandler {
     output_dir: PathBuf,
     /// 共有セッションへの参照
     session: Arc<Mutex<Option<RecordingSession>>>,
+    /// カスタムステータスメッセージ
+    custom_status: Option<String>,
 }
 
 impl BotHandler {
@@ -378,6 +384,14 @@ impl EventHandler for BotHandler {
     /// Botが起動したときに呼ばれます。
     async fn ready(&self, ctx: Context, ready: serenity::model::gateway::Ready) {
         println!("Botが起動しました: {}", ready.user.name);
+
+        if let Some(status_text) = &self.custom_status {
+            use serenity::gateway::ActivityData;
+            let activity = ActivityData::custom(status_text);
+            ctx.set_presence(Some(activity), serenity::model::user::OnlineStatus::Online);
+            println!("カスタムステータスを設定しました: {}", status_text);
+        }
+
         for guild in ready.guilds {
             self.check_and_manage_recording(&ctx, guild.id).await;
         }
@@ -403,6 +417,7 @@ async fn main() {
         target_channel_id: ChannelId::new(args.channel_id),
         output_dir: args.output,
         session: Arc::new(Mutex::new(None)),
+        custom_status: args.status,
     };
 
     // 【最重要設定】Songbird内部で自動的に復号化とPCMデコードを行う
